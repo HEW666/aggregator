@@ -11,15 +11,18 @@ SOCKS5/HTTP 代理批量检测工具
 
 import argparse
 import asyncio
+import html
 import ipaddress
+import json
 import re
 import sys
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from urllib.parse import quote, urlparse
 
 import aiohttp
+import yaml
 from aiohttp_socks import ProxyConnector
 
 COUNTRY_NAME_ZH = {
@@ -275,6 +278,32 @@ COUNTRY_NAME_ZH = {
 }
 
 
+def country_flag_emoji(country_code: str) -> str:
+    if not country_code or len(country_code) != 2:
+        return ""
+
+    code = country_code.upper()
+    if not code.isalpha():
+        return ""
+
+    return chr(0x1F1E6 + ord(code[0]) - ord("A")) + chr(0x1F1E6 + ord(code[1]) - ord("A"))
+
+
+def country_name_zh(country_code: str) -> str:
+    if not country_code:
+        return ""
+
+    return COUNTRY_NAME_ZH.get(country_code.upper(), "")
+
+
+def short_company_name(value: str) -> str:
+    if not value:
+        return "UNKNOWN"
+
+    parts = [part for part in re.split(r"[\s,\.\-_@;:]+", value.strip()) if part]
+    return parts[0].upper() if parts else "UNKNOWN"
+
+
 @dataclass
 class ProxyInfo:
     protocol: str
@@ -308,6 +337,399 @@ class TestResult(ProxyInfo):
         )
 
 
+@dataclass
+class IpLookupResult:
+    ip: Optional[str]
+    data: Optional[Dict]
+    error: Optional[str] = None
+
+
+class IPLibrary:
+    name: str = ""
+
+    async def lookup(
+        self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
+    ) -> IpLookupResult:
+        data, error = await self._fetch(session, proxy_info, retries, timeout)
+        if not data:
+            host = "" if not proxy_info else proxy_info.host
+            return IpLookupResult(None, None, error or f"Failed to get IP info from {self.name}, host: {host}")
+
+        return self._verify(data, self.name)
+
+    def build_remark(self, data: Dict, include_asn_name: bool) -> str:
+        raise NotImplementedError
+
+    async def _fetch(
+        self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
+    ) -> Tuple[Optional[Dict], Optional[str]]:
+        raise NotImplementedError
+
+    @staticmethod
+    def _build_headers(url: str) -> Dict[str, str]:
+        result = urlparse(url)
+        base = f"{result.scheme}://{result.netloc}" if result.scheme and result.netloc else ""
+
+        return {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+            "Connection": "close",
+            "Referer": f"{base}/" if base else url,
+            "Origin": base if base else url,
+        }
+
+    async def _make_request(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        retries: int,
+        timeout: int,
+        headers: Optional[Dict[str, str]] = None,
+        deserialize: bool = True,
+        parser: Optional[Callable[[str], Any]] = None,
+    ) -> Tuple[Optional[Any], Optional[str]]:
+        default_headers = self._build_headers(url)
+        if headers and isinstance(headers, dict):
+            default_headers.update({k: v for k, v in headers.items() if k and v is not None})
+
+        error = None
+        for attempt in range(1, retries + 1):
+            try:
+                async with session.get(
+                    url,
+                    headers=default_headers,
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
+                    if response.status == 200:
+                        content = await response.text()
+
+                        if parser is not None:
+                            data = parser(content)
+                            if data:
+                                return data, None
+
+                            error = "Invalid response payload"
+                        elif deserialize:
+                            try:
+                                data = json.loads(content)
+                            except Exception:
+                                data = None
+
+                            if isinstance(data, dict):
+                                return data, None
+
+                            error = "Invalid JSON response"
+                        else:
+                            return content, None
+
+                    else:
+                        error = f"HTTP {response.status}"
+            except asyncio.TimeoutError:
+                error = "Timeout"
+            except Exception as e:
+                error = str(e)[:100]
+
+            if attempt < retries:
+                await asyncio.sleep(attempt)
+
+        return None, error
+
+    @staticmethod
+    def _verify(data: Dict, source: str) -> IpLookupResult:
+        address = (data.get("ip") or "").strip()
+        if not address:
+            return IpLookupResult(None, None, f"Invalid IP from {source}")
+
+        try:
+            ipaddress.ip_address(address)
+        except ValueError:
+            return IpLookupResult(None, None, f"Invalid IP from {source}, ip: {address}")
+
+        return IpLookupResult(address, data, None)
+
+    @staticmethod
+    def _format_remark(
+        country_code: str,
+        country: str,
+        label: str,
+        include_asn_name: bool,
+        company_name: str,
+        detail: str = "",
+    ) -> str:
+        flag = country_flag_emoji(country_code)
+        base = f"{flag} {country}{label}".strip()
+
+        if include_asn_name and company_name:
+            if detail:
+                return f"{base} [{company_name}::{detail}]".strip()
+
+            return f"{base} [{company_name}]".strip()
+
+        return base
+
+
+class IPInfoLibrary(IPLibrary):
+    name = "ipinfo"
+
+    def build_remark(self, data: Dict, include_asn_name: bool) -> str:
+        country_code = (data.get("country") or "").upper()
+        flag = country_flag_emoji(country_code)
+
+        asn_info = data.get("asn", {}) or {}
+        company_info = data.get("company", {}) or {}
+        asn_type = (asn_info.get("type") or "").lower()
+        company_type = (company_info.get("type") or "").lower()
+
+        asn_name = (asn_info.get("domain") or "").strip()
+        if not asn_name or re.match(r"^as\d+\.", asn_name, flags=re.I):
+            asn_name = (asn_info.get("name") or "").strip()
+
+        company_name = short_company_name(asn_name)
+
+        if asn_type == "isp" and company_type == "isp":
+            label = "家宽"
+        elif asn_type == "isp" or company_type == "isp":
+            label = "商宽"
+        elif asn_type == "edu" or company_type == "edu":
+            label = "教育"
+        else:
+            label = ""
+
+        country = country_name_zh(country_code) or country_code or "未知"
+        base = f"{flag} {country}{label}".strip()
+        if include_asn_name and company_name:
+            return f"{base} [{company_name}]".strip()
+
+        return base
+
+    @staticmethod
+    def _is_ipv4(host: str) -> bool:
+        if not host:
+            return False
+        try:
+            return isinstance(ipaddress.ip_address(host), ipaddress.IPv4Address)
+        except ValueError:
+            return False
+
+    async def _resolve_ip(self, session: aiohttp.ClientSession, host: str, retries: int, timeout: int) -> Optional[str]:
+        if self._is_ipv4(host):
+            return host
+
+        url = "https://ipinfo.io/ip"
+        for attempt in range(1, retries + 1):
+            try:
+                async with session.get(
+                    url,
+                    headers=self._build_headers(url),
+                    timeout=aiohttp.ClientTimeout(total=timeout),
+                ) as response:
+                    if response.status == 200:
+                        text = (await response.text()).strip()
+                        try:
+                            ipaddress.ip_address(text)
+                            return text
+                        except ValueError:
+                            pass
+            except asyncio.TimeoutError:
+                pass
+            except Exception:
+                pass
+
+            if attempt < retries:
+                await asyncio.sleep(attempt)
+
+        return None
+
+    async def _fetch(
+        self, session: aiohttp.ClientSession, proxy_info: ProxyInfo, retries: int, timeout: int
+    ) -> Tuple[Optional[Dict], Optional[str]]:
+        host = proxy_info.host if proxy_info else ""
+        address = await self._resolve_ip(session, host, retries, timeout)
+        if not address:
+            return None, f"Failed to get IP from ipinfo.io/ip, host: {host}"
+
+        url = f"https://ipinfo.io/widget/demo/{address}"
+        data, error = await self._make_request(session, url, retries, timeout)
+        if not data:
+            return None, error or f"Failed to get IP info from ipinfo.io, ip: {address}"
+
+        return data.get("data", data), None
+
+
+class IPPureLibrary(IPLibrary):
+    name = "ippure"
+
+    def build_remark(self, data: Dict, include_asn_name: bool) -> str:
+        residential = data.get("isResidential")
+        label = "家宽" if residential is True else ""
+
+        country_code = (data.get("countryCode") or "").upper()
+        country = country_name_zh(country_code) or (data.get("country") or "未知")
+
+        company_name = short_company_name(data.get("asOrganization") or "")
+        score = str(data.get("fraudScore")).zfill(3) if "fraudScore" in data else "NUL"
+
+        return self._format_remark(
+            country_code=country_code,
+            country=country,
+            label=label,
+            include_asn_name=include_asn_name,
+            company_name=company_name,
+            detail=score,
+        )
+
+    async def _fetch(
+        self, session: aiohttp.ClientSession, _: ProxyInfo, retries: int, timeout: int
+    ) -> Tuple[Optional[Dict], Optional[str]]:
+        url = "https://my.ippure.com/v1/info"
+        return await self._make_request(session, url, retries, timeout)
+
+
+class IP2LocationLibrary(IPLibrary):
+    name = "ip2location"
+
+    def build_remark(self, data: Dict, include_asn_name: bool) -> str:
+        as_info = data.get("as_info") or {}
+
+        usage_type = (data.get("usage_type") or "").strip().lower()
+        as_usage_type = ((as_info.get("as_usage_type") if isinstance(as_info, dict) else "") or "").strip().lower()
+
+        check = lambda usage: usage.startswith("isp") or usage == "mob"
+        label = "家宽" if check(usage_type) and check(as_usage_type) else ""
+
+        country_code = (data.get("country_code") or "").upper()
+        country = (
+            country_name_zh(country_code)
+            or data.get("country_name")
+            or data.get("country", {}).get("name", "")
+            or "未知"
+        )
+
+        provider = (data.get("as", "") or data.get("isp", "") or "").strip()
+        if not provider and as_info and isinstance(as_info, dict):
+            provider = (as_info.get("as_name", "") or as_info.get("as_domain", "")).strip()
+        if not provider:
+            provider = data.get("domain", "").strip() or ""
+
+        company_name = short_company_name(provider)
+        score = str(data.get("fraud_score")).zfill(3) if "fraud_score" in data else "NUL"
+
+        return self._format_remark(
+            country_code=country_code,
+            country=country,
+            label=label,
+            include_asn_name=include_asn_name,
+            company_name=company_name,
+            detail=score,
+        )
+
+    @staticmethod
+    def _extract_data(content: str) -> Dict:
+        if not content or not isinstance(content, str):
+            return {}
+
+        pattern = r'<code\b[^>]*class=["\'][^"\']*\blanguage-json\b[^"\']*["\'][^>]*>(.*?)</code>\s*</pre>'
+        groups = re.findall(pattern, content, flags=re.I | re.S)
+        if not groups:
+            return {}
+
+        for group in groups:
+            payload = group.strip()
+            if not payload:
+                continue
+
+            payload = re.sub(r"<[^>]+>", "", payload, flags=re.I | re.S)
+            payload = html.unescape(payload)
+
+            try:
+                data = json.loads(payload)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+
+        return {}
+
+    async def _fetch(
+        self, session: aiohttp.ClientSession, _: ProxyInfo, retries: int, timeout: int
+    ) -> Tuple[Optional[Dict], Optional[str]]:
+        url = "https://www.ip2location.com/demo"
+        headers = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
+        data, error = await self._make_request(
+            session=session,
+            url=url,
+            retries=retries,
+            timeout=timeout,
+            headers=headers,
+            deserialize=False,
+            parser=self._extract_data,
+        )
+        if not data:
+            return None, "Invalid HTML response" if error == "Invalid response payload" else error
+
+        return data, None
+
+
+class IPLarkLibrary(IPLibrary):
+    name = "iplark"
+
+    def build_remark(self, data: Dict, include_asn_name: bool) -> str:
+        node_type = (data.get("type") or "").strip().lower()
+        if node_type == "isp":
+            label = "家宽"
+        elif node_type == "business":
+            label = "商宽"
+        elif node_type == "education":
+            label = "教育"
+        else:
+            label = ""
+
+        country_code = (data.get("country_code") or "").upper()
+        country = country_name_zh(country_code) or (data.get("country_zh") or data.get("country") or "未知")
+
+        # asn = str(data.get("asn") or "").strip()
+        # detail = f"AS{asn}" if asn else "NUL"
+        detail = ""
+
+        company_name = short_company_name(data.get("organization") or "")
+
+        return self._format_remark(
+            country_code=country_code,
+            country=country,
+            label=label,
+            include_asn_name=include_asn_name,
+            company_name=company_name,
+            detail=detail,
+        )
+
+    async def _fetch(
+        self, session: aiohttp.ClientSession, _: ProxyInfo, retries: int, timeout: int
+    ) -> Tuple[Optional[Dict], Optional[str]]:
+        url = "https://iplark.com/ipapi/public/ipinfo"
+        return await self._make_request(session, url, retries, timeout)
+
+
+IP_LIBRARIES = {
+    "ip2location": IP2LocationLibrary,
+    "iplark": IPLarkLibrary,
+    "ipinfo": IPInfoLibrary,
+    "ippure": IPPureLibrary,
+}
+
+
+def get_ip_library(name: str) -> IPLibrary:
+    key = (name or "ip2location").strip().lower()
+    library = IP_LIBRARIES.get(key)
+    if not library:
+        supported = ", ".join(sorted(IP_LIBRARIES.keys()))
+        raise ValueError(f"Unsupported ip library: {name}. Supported: {supported}")
+
+    return library()
+
+
 class ProxyChecker:
     def __init__(
         self,
@@ -315,6 +737,7 @@ class ProxyChecker:
         format_pattern: Optional[str] = None,
         default_port: int = 1080,
         include_asn_name: bool = False,
+        ip_library: str = "ip2location",
     ):
         """
         初始化代理检测器
@@ -331,6 +754,7 @@ class ProxyChecker:
         self.format_pattern = format_pattern
         self.default_port = default_port
         self.include_asn_name = include_asn_name
+        self.ip_library = get_ip_library(ip_library)
         self.results: List[TestResult] = []
         self.summary: Optional[Dict[str, float]] = None
 
@@ -339,7 +763,7 @@ class ProxyChecker:
         解析代理字符串，支持自定义格式
 
         支持的格式占位符:
-        - {protocol}: 协议类型 (socks5/socks4/http等)
+        - {protocol}: 协议类型 (socks5/socks4/http/https等)
         - {username}: 用户名
         - {password}: 密码
         - {host}: 主机地址
@@ -381,10 +805,7 @@ class ProxyChecker:
                 prefix = f"socks5://{prefix}"
 
             result = urlparse(prefix)
-
             protocol = result.scheme or "socks5"
-            if protocol == "https":
-                protocol = "http"
 
             return ProxyInfo(
                 protocol=protocol,
@@ -471,9 +892,6 @@ class ProxyChecker:
             elif placeholder == "host":
                 host = value
 
-        if protocol == "https":
-            protocol = "http"
-
         return ProxyInfo(
             protocol=protocol,
             username=username,
@@ -489,33 +907,28 @@ class ProxyChecker:
         Test a single proxy with retries.
         """
         result = TestResult.from_proxy(proxy_info)
-
-        # Build proxy URL
-        if proxy_info.username and proxy_info.password:
-            proxy_url = (
-                f"{proxy_info.protocol}://{proxy_info.username}:{proxy_info.password}"
-                f"@{proxy_info.host}:{proxy_info.port}"
-            )
-        else:
-            proxy_url = f"{proxy_info.protocol}://{proxy_info.host}:{proxy_info.port}"
-
         start_time = datetime.now()
         try:
-            connector = ProxyConnector.from_url(proxy_url)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                ip_address = await self._resolve_ip_with_proxy(session, proxy_info.host, retries)
-                if not ip_address:
-                    result.error = "Failed to get IP from ipinfo.io/ip"
+            protocol = (proxy_info.protocol or "").lower()
+            if protocol in ("http", "https"):
+                proxy_url = self._build_proxy_url(proxy_info, include_auth=False)
+                proxy_auth = self._build_proxy_auth(proxy_info)
+                connector = aiohttp.TCPConnector(ssl=False)
+                session = aiohttp.ClientSession(connector=connector, proxy=proxy_url, proxy_auth=proxy_auth)
+            else:
+                proxy_url = self._build_proxy_url(proxy_info, include_auth=True)
+                connector = ProxyConnector.from_url(proxy_url)
+                session = aiohttp.ClientSession(connector=connector)
+
+            async with session:
+                lookup = await self.ip_library.lookup(session, proxy_info, retries, self.timeout)
+                if not lookup.ip or not lookup.data:
+                    result.error = lookup.error or f"Failed to get IP info from {self.ip_library.name}"
                     return result
 
-                ip_data, ip_error = await self._fetch_ipinfo(session, ip_address, retries)
-                if not ip_data:
-                    result.error = ip_error or "Failed to get IP info from ipinfo.io"
-                    return result
-
-                remark = self._build_remark_from_ipinfo(ip_data)
+                remark = self.ip_library.build_remark(lookup.data, self.include_asn_name)
                 result.remark = remark
-                result.ip = ip_address
+                result.ip = lookup.ip
                 result.status = "success"
                 result.response_time = round((datetime.now() - start_time).total_seconds(), 2)
                 result.error = None
@@ -530,77 +943,6 @@ class ProxyChecker:
             result.error = str(e)[:100]
             return result
 
-    def _is_ipv4(self, host: str) -> bool:
-        if not host:
-            return False
-        try:
-            return isinstance(ipaddress.ip_address(host), ipaddress.IPv4Address)
-        except ValueError:
-            return False
-
-    async def _resolve_ip_with_proxy(self, session: aiohttp.ClientSession, host: str, retries: int) -> Optional[str]:
-        if self._is_ipv4(host):
-            return host
-
-        url = "https://ipinfo.io/ip"
-        for attempt in range(1, retries + 1):
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
-                    if response.status == 200:
-                        text = (await response.text()).strip()
-                        try:
-                            ipaddress.ip_address(text)
-                            return text
-                        except ValueError:
-                            pass
-            except asyncio.TimeoutError:
-                pass
-            except Exception:
-                pass
-
-            if attempt < retries:
-                await asyncio.sleep(attempt)
-
-        return None
-
-    async def _fetch_ipinfo(
-        self, session: aiohttp.ClientSession, ip_address: str, retries: int
-    ) -> Tuple[Optional[Dict], Optional[str]]:
-        url = f"https://ipinfo.io/widget/demo/{ip_address}"
-        last_error = None
-        for attempt in range(1, retries + 1):
-            try:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=self.timeout)) as response:
-                    if response.status == 200:
-                        data = await response.json()
-                        if isinstance(data, dict):
-                            return data.get("data", data), None
-                        last_error = "Invalid JSON response"
-                    else:
-                        last_error = f"HTTP {response.status}"
-            except asyncio.TimeoutError:
-                last_error = "Timeout"
-            except Exception as e:
-                last_error = str(e)[:100]
-
-            if attempt < retries:
-                await asyncio.sleep(attempt)
-
-        return None, last_error
-
-    def _country_flag_emoji(self, country_code: str) -> str:
-        if not country_code or len(country_code) != 2:
-            return ""
-        code = country_code.upper()
-        if not code.isalpha():
-            return ""
-        return chr(0x1F1E6 + ord(code[0]) - ord("A")) + chr(0x1F1E6 + ord(code[1]) - ord("A"))
-
-    def _country_name_zh(self, country_code: str) -> str:
-        if not country_code:
-            return ""
-        return COUNTRY_NAME_ZH.get(country_code.upper(), "")
-
     def _format_standard(self, proxy_info: ProxyInfo, remark: str) -> str:
         auth = ""
         if proxy_info.username or proxy_info.password:
@@ -610,60 +952,45 @@ class ProxyChecker:
             return f"{base}#{remark}"
         return base
 
+    def _build_proxy_url(self, proxy_info: ProxyInfo, include_auth: bool) -> str:
+        auth = ""
+        if include_auth and (proxy_info.username or proxy_info.password):
+            username = quote(proxy_info.username or "", safe="")
+            password = quote(proxy_info.password or "", safe="")
+            auth = f"{username}:{password}@"
+
+        return f"{proxy_info.protocol}://{auth}{proxy_info.host}:{proxy_info.port}"
+
+    def _build_proxy_auth(self, proxy_info: ProxyInfo) -> Optional[aiohttp.BasicAuth]:
+        if not (proxy_info.username or proxy_info.password):
+            return None
+
+        return aiohttp.BasicAuth(proxy_info.username or "", proxy_info.password or "")
+
     def _yaml_quote(self, value: str) -> str:
         escaped = value.replace("\\", "\\\\").replace('"', '\\"')
         return f'"{escaped}"'
 
     def _format_yaml_line(self, result: TestResult) -> str:
         name = result.remark or result.host
+        protocol = (result.protocol or "").lower()
+        clash_type = "http" if protocol == "https" else protocol
         parts = [
             f"name: {self._yaml_quote(name)}",
             f"server: {self._yaml_quote(result.host)}",
             f"port: {result.port}",
-            f"type: {self._yaml_quote(result.protocol)}",
+            f"type: {self._yaml_quote(clash_type)}",
         ]
+        if protocol == "https":
+            parts.append("tls: true")
         if result.username:
             parts.append(f"username: {self._yaml_quote(result.username)}")
         if result.password:
             parts.append(f"password: {self._yaml_quote(result.password)}")
         return "  - {" + ", ".join(parts) + "}"
 
-    def _build_remark_from_ipinfo(self, ip_data: Dict) -> str:
-        country_code = (ip_data.get("country") or "").upper()
-        flag = self._country_flag_emoji(country_code)
-        country_display = self._country_name_zh(country_code) or "未知"
-
-        asn_info = ip_data.get("asn", {}) or {}
-        company_info = ip_data.get("company", {}) or {}
-        asn_type = (asn_info.get("type") or "").lower()
-        company_type = (company_info.get("type") or "").lower()
-
-        asn_name = (asn_info.get("domain") or "").strip()
-        if not asn_name:
-            asn_name = (asn_info.get("name") or "").strip()
-
-        if asn_name:
-            parts = [p for p in re.split(r"[\s,\.]+", asn_name) if p]
-            company_name = parts[0].upper() if parts else "UNKNOWN"
-        else:
-            company_name = "UNKNOWN"
-
-        if asn_type == "isp" and company_type == "isp":
-            label = "家宽"
-        elif asn_type == "isp" or company_type == "isp":
-            label = "商宽"
-        elif asn_type == "edu" or company_type == "edu":
-            label = "教育"
-        else:
-            label = ""
-
-        base = f"{flag} {country_display}{label}".strip()
-        if self.include_asn_name and company_name:
-            return f"{base} [{company_name}]".strip()
-        return base
-
-    def _renumber_output_file(self, output_file: str, output_format: str, digits: int = 2) -> None:
-        proxies = read_proxies_from_file(output_file)
+    def _convert(self, input_file: str, output_file: str, output_format: str, digits: int = 2) -> None:
+        proxies = read_proxies(input_file)
         if not proxies:
             return
 
@@ -686,8 +1013,16 @@ class ProxyChecker:
             info.remark = name
             groups.setdefault(name, []).append(info)
 
+        # 按代理名称升序排序
+        names = sorted(list(groups.keys()))
+
         lines: List[str] = []
-        for name, nodes in groups.items():
+        for name in names:
+            nodes = groups.get(name, [])
+
+            # 按类型排序
+            nodes.sort(key=lambda x: x.protocol)
+
             width = max(digits, len(str(len(nodes))))
             for index, info in enumerate(nodes):
                 content = f"{name} {str(index + 1).zfill(width)}"
@@ -756,7 +1091,7 @@ class ProxyChecker:
         output_handle = None
 
         if not output_file:
-            output_file = f'{output_format}.{"txt" if output_format == "v2ray" else "yaml"}'
+            output_file = f'{output_format}-{self.ip_library}.{"txt" if output_format == "v2ray" else "yaml"}'
 
         output_handle = open(output_file, "w", encoding="utf-8")
         if output_format == "clash":
@@ -788,12 +1123,22 @@ class ProxyChecker:
                 # 实时输出结果
                 status_icon = "✓" if result.status == "success" else "✗"
                 if result.status == "success":
-                    print(f"{status_icon} {result.original[:60]}... | {result.response_time}s | IP: {result.ip}")
+                    print(
+                        f"{status_icon} {result.original[:60]}... | {result.response_time}s | Export IP: {result.ip}".encode(
+                            "utf-8", errors="ignore"
+                        ).decode(
+                            "utf-8"
+                        )
+                    )
                     if write_queue:
                         line = self._format_yaml_line(result) if output_format == "clash" else result.proxy
                         await write_queue.put(line + "\n")
                 else:
-                    print(f"{status_icon} {result.original[:60]}... | {result.error}")
+                    print(
+                        f"{status_icon} {result.original[:60]}... | {result.error}".encode(
+                            "utf-8", errors="ignore"
+                        ).decode("utf-8")
+                    )
 
                 async with stats_lock:
                     if result.status == "success":
@@ -802,6 +1147,14 @@ class ProxyChecker:
                             stats["total_time"] += result.response_time
                     else:
                         stats["failed"] += 1
+
+                    completed = stats["success"] + stats["failed"]
+                    if completed % 100 == 0 or completed == stats["total"]:
+                        remaining = stats["total"] - completed
+                        progress = (completed / stats["total"] * 100) if stats["total"] else 0.0
+                        print(
+                            f"💡 测试进度: {progress:.1f}% | 总数: {stats['total']} | 已完成: {completed} | 待测试: {remaining} | 可用: {stats['success']}"
+                        )
 
                 return result
 
@@ -829,7 +1182,7 @@ class ProxyChecker:
         }
 
         if output_file and stats["success"] > 0:
-            self._renumber_output_file(output_file, output_format)
+            self._convert(output_file, output_file, output_format)
 
         if output_file:
             self.results = []
@@ -886,140 +1239,105 @@ class ProxyChecker:
         print(f"\n结果已保存到: {output_file}")
 
 
-def read_proxies_from_file(file_path: str) -> List[str]:
+def read_proxies(filepath: str) -> List[str]:
     """
     从文件读取代理列表
 
     Args:
-        file_path: 文件路径
+        filepath: 文件路径
 
     Returns:
         代理列表
     """
     try:
-        with open(file_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
+        with open(filepath, "r", encoding="utf-8") as f:
+            content = f.read()
 
-        def strip_quotes(value: str) -> str:
-            value = value.strip()
-            if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-                return value[1:-1]
-            return value
+        def _build_proxy(entry: Dict) -> Optional[str]:
+            host = entry.get("server") or entry.get("host")
+            port = entry.get("port")
+            if not host or port is None:
+                return None
 
-        def split_inline_items(text: str) -> List[str]:
-            buffers, items = [], []
-            in_quote = None
-            escape = False
-
-            for c in text:
-                if in_quote:
-                    if escape:
-                        buffers.append(c)
-                        escape = False
-                        continue
-                    if c == "\\":
-                        escape = True
-                        buffers.append(c)
-                        continue
-                    if c == in_quote:
-                        in_quote = None
-                    buffers.append(c)
-                    continue
-                if c in ("'", '"'):
-                    in_quote = c
-                    buffers.append(c)
-                    continue
-                if c == ",":
-                    item = "".join(buffers).strip()
-                    if item:
-                        items.append(item)
-                    buffers = []
-                    continue
-                buffers.append(c)
-
-            tail = "".join(buffers).strip()
-            if tail:
-                items.append(tail)
-            return items
-
-        def parse_inline_map(text: str) -> Dict[str, str]:
-            data: Dict[str, str] = {}
-            for item in split_inline_items(text):
-                if ":" not in item:
-                    continue
-                key, value = item.split(":", 1)
-                data[key.strip()] = strip_quotes(value.strip())
-            return data
-
-        def parse_yaml_entries(file_lines: List[str]) -> List[Dict[str, str]]:
-            entries: List[Dict[str, str]] = []
-            in_proxies = False
-            current: Optional[Dict[str, str]] = None
-            for raw in file_lines:
-                line = raw.strip()
-                if not line or line.startswith("#"):
-                    continue
-                if line.startswith("proxies:"):
-                    in_proxies = True
-                    continue
-                if not in_proxies:
-                    continue
-                if line.startswith("- "):
-                    if current:
-                        entries.append(current)
-                        current = None
-                    rest = line[2:].strip()
-                    if rest.startswith("{") and rest.endswith("}"):
-                        entries.append(parse_inline_map(rest[1:-1]))
-                    else:
-                        current = {}
-                        if ":" in rest:
-                            key, value = rest.split(":", 1)
-                            current[key.strip()] = strip_quotes(value.strip())
-                else:
-                    if current and ":" in line:
-                        key, value = line.split(":", 1)
-                        current[key.strip()] = strip_quotes(value.strip())
-            if current:
-                entries.append(current)
-            return entries
-
-        def yaml_entries_to_proxies(entries: List[Dict[str, str]]) -> List[str]:
-            proxies: List[str] = []
-            for entry in entries:
-                host = entry.get("server") or entry.get("host")
-                port_value = entry.get("port")
-                if not host or port_value is None:
-                    continue
+            if not type(port) != int:
                 try:
-                    port = int(str(port_value))
-                except ValueError:
-                    continue
-                protocol = (entry.get("type") or "socks5").strip()
-                if protocol == "https":
-                    protocol = "http"
-                username = entry.get("username") or ""
-                password = entry.get("password") or ""
-                name = entry.get("name") or ""
-                auth = ""
-                if username or password:
-                    auth = f"{username}:{password}@"
-                proxy = f"{protocol}://{auth}{host}:{port}"
-                if name:
-                    proxy = f"{proxy}#{name}"
-                proxies.append(proxy)
-            return proxies
+                    port = int(str(port).strip())
+                except (TypeError, ValueError):
+                    return None
 
-        if any(line.strip().startswith("proxies:") for line in lines):
-            entries = parse_yaml_entries(lines)
-            clash_proxies = yaml_entries_to_proxies(entries)
-            if clash_proxies:
-                return clash_proxies
+            protocol = str(entry.get("type") or "socks5").strip().lower()
+            if protocol == "http" and entry.get("tls") is True:
+                protocol = "https"
+            elif protocol == "socks":
+                protocol = "socks5"
 
-        proxies = [line.strip() for line in lines if line.strip() and not line.startswith("#")]
+            username = entry.get("username") or ""
+            password = entry.get("password") or ""
+            name = entry.get("name") or ""
+
+            auth = ""
+            if username or password:
+                auth = f"{username}:{password}@"
+            proxy = f"{protocol}://{auth}{host}:{port}"
+            if name:
+                proxy = f"{proxy}#{name}"
+            return proxy
+
+        def _load_proxies(data) -> List[str]:
+            if data is None:
+                return []
+
+            if isinstance(data, dict):
+                if "proxies" in data:
+                    return _load_proxies(data.get("proxies"))
+
+                return []
+
+            if isinstance(data, list):
+                proxies: List[str] = []
+                for item in data:
+                    if isinstance(item, str):
+                        value = item.strip()
+                        if value and not value.startswith("#"):
+                            proxies.append(value)
+                        continue
+
+                    if isinstance(item, dict):
+                        proxy = _build_proxy(item)
+                        if proxy:
+                            proxies.append(proxy)
+                return proxies
+
+            if isinstance(data, str):
+                value = data.strip()
+                if "\n" in value or "\r" in value:
+                    return []
+                if value and "://" in value:
+                    return [value]
+            return []
+
+        def _parse_yaml(text: str) -> Tuple[Optional[List[str]], Optional[object]]:
+            try:
+                data = yaml.safe_load(text)
+            except yaml.YAMLError:
+                return None, None
+
+            return _load_proxies(data), data
+
+        if filepath.lower().endswith((".yaml", ".yml")) or "proxies:" in content:
+            proxies, data = _parse_yaml(content)
+            if proxies:
+                return proxies
+
+            if data is not None and not isinstance(data, str):
+                print(f"错误：Yaml 格式文件不正确 - {filepath}")
+                return []
+
+        lines = content.splitlines()
+        proxies = [line.strip() for line in lines if line.strip() and not line.strip().startswith("#")]
         return proxies
     except FileNotFoundError:
-        print(f"错误: 文件不存在 - {file_path}")
+        print(f"错误: 文件不存在 - {filepath}")
         sys.exit(1)
     except Exception as e:
         print(f"错误: 读取文件失败 - {e}")
@@ -1073,7 +1391,7 @@ async def main():
   %(prog)s -f proxies.txt --input-format "socks5://{host}:{port}:{username}:{password}"
 
 支持的格式占位符:
-  {protocol}  - 协议类型 (socks5/socks4/http等)
+  {protocol}  - 协议类型 (socks5/socks4/http/https等)
   {username}  - 用户名
   {password}  - 密码
   {host}      - 主机地址/IP
@@ -1107,12 +1425,20 @@ async def main():
         help="在备注中追加 ASN 名称 (默认不追加)",
     )
 
+    parser.add_argument(
+        "--ip-library",
+        dest="ip_library",
+        choices=sorted(IP_LIBRARIES.keys()),
+        default="ip2location",
+        help="IP地址数据库服务商: ip2location、iplark、ipinfo 或 ippure (默认: ip2location)",
+    )
+
     args = parser.parse_args()
 
     # 获取代理列表
     proxies = []
     if args.file:
-        proxies = read_proxies_from_file(args.file)
+        proxies = read_proxies(args.file)
     elif args.proxy:
         proxies = [args.proxy]
     else:
@@ -1134,6 +1460,7 @@ async def main():
         format_pattern=args.format_pattern,
         default_port=args.default_port,
         include_asn_name=args.include_asn_name,
+        ip_library=args.ip_library,
     )
 
     await checker.check_proxies(
